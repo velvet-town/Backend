@@ -2,7 +2,6 @@ package Player_Logic
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
@@ -30,120 +29,116 @@ type WebSocketMessage struct {
 	Data     json.RawMessage `json:"data,omitempty"`
 }
 
-// HandleWebSocket handles a new WebSocket connection
-func (rm *RoomManager) HandleWebSocket(conn *websocket.Conn, playerID string) {
+// HandleWebSocket handles WebSocket connections
+func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	playerID := r.URL.Query().Get("token")
+	if playerID == "" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Upgrade HTTP connection to WebSocket
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 
-	// Get or create player
-	rm.mu.Lock()
-	player := rm.GetPlayer(playerID)
-	if player == nil {
-		player = &Player{
-			ID:       playerID,
-			Position: Position{X: 0, Y: 0},
-			IsActive: true,
-			LastSeen: time.Now(),
-			WS:       conn,
-		}
-		rm.AddPlayer(playerID)
-	} else {
-		player.WS = conn
-		player.IsActive = true
-		player.LastSeen = time.Now()
-	}
-	rm.mu.Unlock()
+	// Get room manager
+	rm := GetRoomManager()
 
-	// Notify other players about new player
-	rm.broadcastPlayerJoined(player)
+	// Get player
+	rm.mainRoom.mu.RLock()
+	player, exists := rm.mainRoom.Players[playerID]
+	rm.mainRoom.mu.RUnlock()
 
-	// Handle incoming messages
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("Error reading message: %v", err)
-			break
-		}
-
-		var wsMessage WebSocketMessage
-		if err := json.Unmarshal(message, &wsMessage); err != nil {
-			log.Printf("Error unmarshaling message: %v", err)
-			continue
-		}
-
-		// Handle different message types
-		switch wsMessage.Type {
-		case "position_update":
-			if wsMessage.Position != nil {
-				rm.handlePositionUpdate(playerID, *wsMessage.Position)
-			}
-		}
+	if !exists {
+		return
 	}
 
-	// Handle disconnection
-	rm.mu.Lock()
-	if player := rm.GetPlayer(playerID); player != nil {
-		player.IsActive = false
-		player.LastSeen = time.Now()
-		player.WS = nil
+	// Update player's WebSocket connection
+	rm.mainRoom.mu.Lock()
+	player.WS = conn
+	player.IsActive = true
+	player.LastSeen = time.Now()
+	rm.mainRoom.mu.Unlock()
+
+	// Send current room state
+	rm.mainRoom.mu.RLock()
+	players := make([]*Player, 0, len(rm.mainRoom.Players))
+	for _, p := range rm.mainRoom.Players {
+		if p.ID != playerID {
+			players = append(players, p)
+		}
 	}
-	rm.mu.Unlock()
+	rm.mainRoom.mu.RUnlock()
 
-	// Notify other players about player leaving
-	rm.broadcastPlayerLeft(playerID)
-}
-
-// broadcastPlayerJoined notifies other players about a new player
-func (rm *RoomManager) broadcastPlayerJoined(player *Player) {
-	message := WebSocketMessage{
+	// Send player_joined message to other players
+	joinMessage := WebSocketMessage{
 		Type:     "player_joined",
-		PlayerID: player.ID,
+		PlayerID: playerID,
 		Position: &player.Position,
 	}
 
-	rm.broadcastToOthers(player.ID, message)
-}
+	rm.mainRoom.mu.RLock()
+	for id, otherPlayer := range rm.mainRoom.Players {
+		if id != playerID && otherPlayer.WS != nil {
+			otherPlayer.WS.WriteJSON(joinMessage)
+		}
+	}
+	rm.mainRoom.mu.RUnlock()
 
-// broadcastPlayerLeft notifies other players about a player leaving
-func (rm *RoomManager) broadcastPlayerLeft(playerID string) {
-	message := WebSocketMessage{
+	// Send current players to new player
+	for _, p := range players {
+		message := WebSocketMessage{
+			Type:     "player_joined",
+			PlayerID: p.ID,
+			Position: &p.Position,
+		}
+		if err := conn.WriteJSON(message); err != nil {
+			return
+		}
+	}
+
+	// Handle WebSocket messages
+	for {
+		var message WebSocketMessage
+		err := conn.ReadJSON(&message)
+		if err != nil {
+			break
+		}
+
+		switch message.Type {
+		case "position_update":
+			if message.Position != nil {
+				rm.handlePositionUpdate(playerID, *message.Position)
+			}
+		case "leave_room":
+			rm.RemovePlayer(playerID)
+			return
+		}
+	}
+
+	// Cleanup on disconnect
+	rm.mainRoom.mu.Lock()
+	if player, exists := rm.mainRoom.Players[playerID]; exists {
+		player.WS = nil
+		player.IsActive = false
+		player.LastSeen = time.Now()
+	}
+	rm.mainRoom.mu.Unlock()
+
+	// Notify other players
+	leaveMessage := WebSocketMessage{
 		Type:     "player_left",
 		PlayerID: playerID,
 	}
 
-	rm.broadcastToOthers(playerID, message)
-}
-
-// broadcastToOthers sends a message to all players except the sender
-func (rm *RoomManager) broadcastToOthers(senderID string, message WebSocketMessage) {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-
-	for _, room := range rm.rooms {
-		for id, player := range room.Players {
-			if id != senderID && player.WS != nil {
-				if err := player.WS.WriteJSON(message); err != nil {
-					log.Printf("Error sending message to player %s: %v", id, err)
-				}
-			}
+	rm.mainRoom.mu.RLock()
+	for id, otherPlayer := range rm.mainRoom.Players {
+		if id != playerID && otherPlayer.WS != nil {
+			otherPlayer.WS.WriteJSON(leaveMessage)
 		}
 	}
-}
-
-// handlePositionUpdate processes a position update from a player
-func (rm *RoomManager) handlePositionUpdate(playerID string, position Position) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	if player := rm.GetPlayer(playerID); player != nil {
-		player.Position = position
-		player.LastSeen = time.Now()
-
-		// Broadcast position update to other players
-		message := WebSocketMessage{
-			Type:     "position_update",
-			PlayerID: playerID,
-			Position: &position,
-		}
-		rm.broadcastToOthers(playerID, message)
-	}
+	rm.mainRoom.mu.RUnlock()
 }

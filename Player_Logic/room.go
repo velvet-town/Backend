@@ -2,26 +2,27 @@ package Player_Logic
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
 
 const (
-	MaxPlayersPerRoom   = 20
-	RoomCleanupInterval = 5 * time.Minute
+	MaxPlayersPerRoom = 20
 )
 
+// Room represents a game room
 type Room struct {
 	ID        string
-	Players   map[string]*Player // Using map for O(1) player lookup
+	Players   map[string]*Player
 	CreatedAt time.Time
 	mu        sync.RWMutex
 }
 
+// RoomManager manages all game rooms
 type RoomManager struct {
-	rooms    map[string]*Room
+	mainRoom *Room
 	mu       sync.RWMutex
-	stopChan chan struct{}
 }
 
 var (
@@ -33,223 +34,123 @@ var (
 func GetRoomManager() *RoomManager {
 	once.Do(func() {
 		manager = &RoomManager{
-			rooms:    make(map[string]*Room),
-			stopChan: make(chan struct{}),
+			mainRoom: &Room{
+				ID:        "main_room",
+				Players:   make(map[string]*Player),
+				CreatedAt: time.Now(),
+			},
 		}
-		go manager.cleanupInactiveRooms()
 	})
 	return manager
 }
 
-// CreateRoom creates a new room
-func (rm *RoomManager) CreateRoom() *Room {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	roomID := fmt.Sprintf("room_%d", len(rm.rooms)+1)
-	room := &Room{
-		ID:        roomID,
-		Players:   make(map[string]*Player),
-		CreatedAt: time.Now(),
-	}
-	rm.rooms[roomID] = room
-	return room
-}
-
-// FindOrCreateRoom finds a room with space or creates a new one
-func (rm *RoomManager) FindOrCreateRoom() *Room {
-	rm.mu.RLock()
-	for _, room := range rm.rooms {
-		room.mu.RLock()
-		if len(room.Players) < MaxPlayersPerRoom {
-			room.mu.RUnlock()
-			rm.mu.RUnlock()
-			return room
-		}
-		room.mu.RUnlock()
-	}
-	rm.mu.RUnlock()
-	return rm.CreateRoom()
-}
-
-// AddPlayer adds a player to a room or reconnects them if in grace period
+// AddPlayer adds a player to the main room
 func (rm *RoomManager) AddPlayer(playerID string) (*Room, error) {
-	// First check if player is in grace period in any room
-	rm.mu.RLock()
-	for _, room := range rm.rooms {
-		room.mu.Lock()
-		if player, exists := room.Players[playerID]; exists {
-			if player.IsGracePeriodActive() {
-				// Reconnect player
-				player.mu.Lock()
-				player.IsActive = true
-				player.LastSeen = time.Now()
-				player.mu.Unlock()
-				room.mu.Unlock()
-				rm.mu.RUnlock()
-				return room, nil
-			}
-		}
-		room.mu.Unlock()
+	log.Printf("Attempting to add player %s to room", playerID)
+
+	// Check if player already exists
+	rm.mainRoom.mu.RLock()
+	if _, exists := rm.mainRoom.Players[playerID]; exists {
+		rm.mainRoom.mu.RUnlock()
+		log.Printf("Player %s already exists in room", playerID)
+		return rm.mainRoom, nil
 	}
-	rm.mu.RUnlock()
+	rm.mainRoom.mu.RUnlock()
 
-	// If not in grace period, add to new room
-	room := rm.FindOrCreateRoom()
+	// Check room capacity
+	rm.mainRoom.mu.Lock()
+	defer rm.mainRoom.mu.Unlock()
 
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	if len(room.Players) >= MaxPlayersPerRoom {
+	if len(rm.mainRoom.Players) >= MaxPlayersPerRoom {
+		log.Printf("Room is full, cannot add player %s", playerID)
 		return nil, fmt.Errorf("room is full")
 	}
 
+	// Create and add player
 	player := &Player{
 		ID:       playerID,
-		RoomID:   room.ID,
+		Position: Position{X: 0, Y: 0},
 		IsActive: true,
 		LastSeen: time.Now(),
 	}
-	room.Players[playerID] = player
-	return room, nil
+
+	rm.mainRoom.Players[playerID] = player
+	log.Printf("Added player %s to room", playerID)
+
+	return rm.mainRoom, nil
 }
 
-// RemovePlayer marks a player as disconnected instead of removing them immediately
+// RemovePlayer removes a player from the room
 func (rm *RoomManager) RemovePlayer(playerID string) {
-	rm.mu.RLock()
-	for _, room := range rm.rooms {
-		room.mu.Lock()
-		if player, exists := room.Players[playerID]; exists {
-			player.MarkDisconnected()
-			room.mu.Unlock()
-			rm.mu.RUnlock()
-			return
-		}
-		room.mu.Unlock()
+	log.Printf("Removing player %s from room", playerID)
+
+	rm.mainRoom.mu.Lock()
+	defer rm.mainRoom.mu.Unlock()
+
+	if player, exists := rm.mainRoom.Players[playerID]; exists {
+		player.IsActive = false
+		player.LastSeen = time.Now()
+		delete(rm.mainRoom.Players, playerID)
+		log.Printf("Removed player %s from room", playerID)
 	}
-	rm.mu.RUnlock()
 }
 
-// GetRoomPlayers returns all players in a room
+// GetPlayer returns a player by ID
 func (rm *RoomManager) GetPlayer(playerID string) *Player {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
+	rm.mainRoom.mu.RLock()
+	defer rm.mainRoom.mu.RUnlock()
 
-	for _, room := range rm.rooms {
-		room.mu.RLock()
-		if player, exists := room.Players[playerID]; exists {
-			room.mu.RUnlock()
-			return player
-		}
-		room.mu.RUnlock()
+	if player, exists := rm.mainRoom.Players[playerID]; exists {
+		return player
 	}
 	return nil
 }
 
-// GetRoomPlayers returns all players in the room containing the specified player
-func (rm *RoomManager) GetRoomPlayers(playerID string) []*Player {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
+// GetPlayerRoom returns the room containing the specified player
+func (rm *RoomManager) GetPlayerRoom(playerID string) *Room {
+	rm.mainRoom.mu.RLock()
+	defer rm.mainRoom.mu.RUnlock()
 
-	// First find the room containing the player
-	var targetRoom *Room
-	for _, room := range rm.rooms {
-		room.mu.RLock()
-		if _, exists := room.Players[playerID]; exists {
-			targetRoom = room
-			room.mu.RUnlock()
-			break
-		}
-		room.mu.RUnlock()
+	if _, exists := rm.mainRoom.Players[playerID]; exists {
+		return rm.mainRoom
 	}
+	return nil
+}
 
-	if targetRoom == nil {
-		return nil
-	}
+// GetRoomPlayers returns all players in the room
+func (rm *RoomManager) GetRoomPlayers() []*Player {
+	rm.mainRoom.mu.RLock()
+	defer rm.mainRoom.mu.RUnlock()
 
-	// Get all players from the target room
-	targetRoom.mu.RLock()
-	defer targetRoom.mu.RUnlock()
-
-	players := make([]*Player, 0, len(targetRoom.Players))
-	for _, player := range targetRoom.Players {
+	players := make([]*Player, 0, len(rm.mainRoom.Players))
+	for _, player := range rm.mainRoom.Players {
 		players = append(players, player)
 	}
 	return players
 }
 
-// cleanupInactiveRooms periodically removes empty rooms and players past grace period
-func (rm *RoomManager) cleanupInactiveRooms() {
-	ticker := time.NewTicker(5 * time.Second) // Check more frequently
-	defer ticker.Stop()
+// handlePositionUpdate updates a player's position and broadcasts it
+func (rm *RoomManager) handlePositionUpdate(playerID string, position Position) {
+	rm.mainRoom.mu.Lock()
+	defer rm.mainRoom.mu.Unlock()
 
-	for {
-		select {
-		case <-ticker.C:
-			rm.mu.Lock()
-			for roomID, room := range rm.rooms {
-				room.mu.Lock()
-				// Remove players past grace period
-				for playerID, player := range room.Players {
-					if !player.IsGracePeriodActive() {
-						delete(room.Players, playerID)
-					}
+	if player, exists := rm.mainRoom.Players[playerID]; exists {
+		player.Position = position
+		player.LastSeen = time.Now()
+
+		// Broadcast position to other players
+		message := WebSocketMessage{
+			Type:     "position_update",
+			PlayerID: playerID,
+			Position: &position,
+		}
+
+		for id, otherPlayer := range rm.mainRoom.Players {
+			if id != playerID && otherPlayer.WS != nil {
+				if err := otherPlayer.WS.WriteJSON(message); err != nil {
+					log.Printf("Error broadcasting position to player %s: %v", id, err)
 				}
-				// Remove empty rooms
-				if len(room.Players) == 0 {
-					delete(rm.rooms, roomID)
-				}
-				room.mu.Unlock()
 			}
-			rm.mu.Unlock()
-		case <-rm.stopChan:
-			return
 		}
 	}
-}
-
-// UpdatePlayerPosition updates a player's position and broadcasts it to other players in the room
-func (rm *RoomManager) UpdatePlayerPosition(playerID string, x, y float64) error {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	// Find the room containing the player
-	var playerRoom *Room
-	for _, room := range rm.rooms {
-		if _, exists := room.Players[playerID]; exists {
-			playerRoom = room
-			break
-		}
-	}
-
-	if playerRoom == nil {
-		return fmt.Errorf("player not found in any room")
-	}
-
-	// Update player position
-	player := playerRoom.Players[playerID]
-	player.Position.X = x
-	player.Position.Y = y
-
-	// Broadcast position update to other players in the room
-	positionUpdate := struct {
-		Type     string  `json:"type"`
-		PlayerID string  `json:"player_id"`
-		X        float64 `json:"x"`
-		Y        float64 `json:"y"`
-	}{
-		Type:     "position_update",
-		PlayerID: playerID,
-		X:        x,
-		Y:        y,
-	}
-
-	// Send update to all other players in the room
-	for otherPlayerID, otherPlayer := range playerRoom.Players {
-		if otherPlayerID != playerID && otherPlayer.WS != nil {
-			otherPlayer.WS.WriteJSON(positionUpdate)
-		}
-	}
-
-	return nil
 }
