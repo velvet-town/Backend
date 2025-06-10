@@ -2,6 +2,7 @@ package Player_Logic
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 
@@ -27,6 +28,8 @@ type WebSocketMessage struct {
 	PlayerID string          `json:"player_id"`
 	Position *Position       `json:"position,omitempty"`
 	Data     json.RawMessage `json:"data,omitempty"`
+	Text     string          `json:"text,omitempty"`
+	Username string          `json:"username,omitempty"`
 }
 
 // HandleWebSocket handles WebSocket connections
@@ -116,6 +119,24 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case "leave_room":
 			rm.RemovePlayer(playerID)
 			return
+		case "chat_message":
+			// Debug log for incoming chat message
+			log.Printf("[Chat Debug] Received chat message from %s: %s (username: %s)", playerID, message.Text, message.Username)
+			// Broadcast chat message to all players
+			chatMessage := WebSocketMessage{
+				Type:     "chat_message",
+				PlayerID: playerID,
+				Text:     message.Text,
+				Username: message.Username,
+			}
+			log.Printf("[Chat Debug] Broadcasting chat message: %+v", chatMessage)
+			rm.mainRoom.mu.RLock()
+			for _, otherPlayer := range rm.mainRoom.Players {
+				if otherPlayer.WS != nil {
+					otherPlayer.WS.WriteJSON(chatMessage)
+				}
+			}
+			rm.mainRoom.mu.RUnlock()
 		}
 	}
 
