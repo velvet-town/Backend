@@ -120,9 +120,9 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			rm.RemovePlayer(playerID)
 			return
 		case "chat_message":
-			// Debug log for incoming chat message
+			// Always use playerID from the connection, ignore any player_id sent by the client for security and consistency
 			log.Printf("[Chat Debug] Received chat message from %s: %s (username: %s)", playerID, message.Text, message.Username)
-			// Broadcast chat message to all players
+			// Broadcast chat message to all players except the sender
 			chatMessage := WebSocketMessage{
 				Type:     "chat_message",
 				PlayerID: playerID,
@@ -131,8 +131,8 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[Chat Debug] Broadcasting chat message: %+v", chatMessage)
 			rm.mainRoom.mu.RLock()
-			for _, otherPlayer := range rm.mainRoom.Players {
-				if otherPlayer.WS != nil {
+			for id, otherPlayer := range rm.mainRoom.Players {
+				if id != playerID && otherPlayer.WS != nil {
 					otherPlayer.WS.WriteJSON(chatMessage)
 				}
 			}
