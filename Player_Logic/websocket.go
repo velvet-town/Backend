@@ -142,10 +142,9 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Cleanup on disconnect
 	rm.mainRoom.mu.Lock()
-	if player, exists := rm.mainRoom.Players[playerID]; exists {
-		player.WS = nil
-		player.IsActive = false
-		player.LastSeen = time.Now()
+	if _, exists := rm.mainRoom.Players[playerID]; exists {
+		delete(rm.mainRoom.Players, playerID)
+		log.Printf("Removed player %s from room. Remaining players: %v", playerID, rm.mainRoom.Players)
 	}
 	rm.mainRoom.mu.Unlock()
 
@@ -154,7 +153,6 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Type:     "player_left",
 		PlayerID: playerID,
 	}
-
 	rm.mainRoom.mu.RLock()
 	for id, otherPlayer := range rm.mainRoom.Players {
 		if id != playerID && otherPlayer.WS != nil {
