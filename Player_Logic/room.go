@@ -3,12 +3,15 @@ package Player_Logic
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 )
 
 const (
 	MaxPlayersPerRoom = 20
+	RoomCodeLength    = 6
+	RoomCodeChars     = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 // Room represents a game room
@@ -30,12 +33,22 @@ var (
 	once    sync.Once
 )
 
+// generateRoomCode creates a unique 6-character room code
+func generateRoomCode() string {
+	rand.Seed(time.Now().UnixNano())
+	code := make([]byte, RoomCodeLength)
+	for i := range code {
+		code[i] = RoomCodeChars[rand.Intn(len(RoomCodeChars))]
+	}
+	return string(code)
+}
+
 // GetRoomManager returns singleton instance
 func GetRoomManager() *RoomManager {
 	once.Do(func() {
 		manager = &RoomManager{
 			mainRoom: &Room{
-				ID:        "main_room",
+				ID:        generateRoomCode(), // Generate 6-character room code
 				Players:   make(map[string]*Player),
 				CreatedAt: time.Now(),
 			},

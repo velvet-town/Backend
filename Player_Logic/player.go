@@ -51,5 +51,5 @@ func (p *Player) IsGracePeriodActive() bool {
 	if p.IsActive {
 		return true
 	}
-	return time.Since(p.LastSeen) < 40*time.Second
+	return time.Since(p.LastSeen) < 80*time.Second
 }
