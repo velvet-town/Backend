@@ -1,6 +1,8 @@
 package Routing
 
 import (
+	"encoding/json"
+	"log"
 	"net/http"
 	"velvet/config"
 )
@@ -9,40 +11,106 @@ import (
 func SetupAuthRoutes() *config.Router {
 	router := config.NewRouter("/auth")
 
-	// Login route
-	router.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+	// User exists endpoint
+	router.HandleFunc("/user-exists", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte("Login endpoint"))
+		type reqBody struct {
+			UserId string `json:"userId"`
+		}
+		var body reqBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			log.Println("Decode error:", err)
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if body.UserId == "" {
+			http.Error(w, "userId is required", http.StatusBadRequest)
+			return
+		}
+		var exists bool
+		err := config.DB.QueryRow(`SELECT EXISTS (SELECT 1 FROM "User" WHERE "userId" = $1)`, body.UserId).Scan(&exists)
+		if err != nil {
+			log.Println("Database error:", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"exists": exists})
 	})
 
-	// Register route
-	router.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+	// Update or insert user endpoint
+	router.HandleFunc("/update-user", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte("Register endpoint"))
+		type reqBody struct {
+			UserId     string `json:"userId"`
+			Username   string `json:"username"`
+			Gender     string `json:"gender"`
+			Email      string `json:"email"`
+			ProfilePic string `json:"profile_pic"`
+		}
+		var body reqBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			log.Println("Decode error:", err)
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if body.UserId == "" || body.Username == "" || body.Gender == "" {
+			http.Error(w, "userId, username, and gender are required", http.StatusBadRequest)
+			return
+		}
+		_, err := config.DB.Exec(`
+			INSERT INTO "User" ("userId", username, gender, email, profile_pic)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT ("userId") DO UPDATE SET username = $2, gender = $3, email = $4, profile_pic = $5
+		`, body.UserId, body.Username, body.Gender, body.Email, body.ProfilePic)
+		if err != nil {
+			log.Println("Database error:", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
 	})
 
-	// Logout route
-	router.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
+	// Get user data by userId
+	router.HandleFunc("/get-user", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte("Logout endpoint"))
-	})
-
-	// Forgot password route
-	router.HandleFunc("/forgot-password", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		type reqBody struct {
+			UserId string `json:"userId"`
+		}
+		var body reqBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			log.Println("Decode error:", err)
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		w.Write([]byte("Forgot password endpoint"))
+		if body.UserId == "" {
+			http.Error(w, "userId is required", http.StatusBadRequest)
+			return
+		}
+		var username, gender, email, profilePic string
+		err := config.DB.QueryRow(`SELECT username, gender, email, profile_pic FROM "User" WHERE "userId" = $1`, body.UserId).Scan(&username, &gender, &email, &profilePic)
+		if err != nil {
+			log.Println("Database error:", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"username":    username,
+			"gender":      gender,
+			"email":       email,
+			"profile_pic": profilePic,
+		})
 	})
 
 	return router

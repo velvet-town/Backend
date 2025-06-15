@@ -7,6 +7,8 @@ import (
 	"os"
 	"velvet/Routing"
 
+	"velvet/config"
+
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 )
@@ -23,6 +25,11 @@ func main() {
 	// Load environment variables
 	if err := godotenv.Load("config/config.env"); err != nil {
 		log.Fatal("Error loading config.env file:", err)
+	}
+
+	// Initialize database
+	if err := config.InitDB(); err != nil {
+		log.Fatal("Error initializing database:", err)
 	}
 
 	port := os.Getenv("PORT")
@@ -63,6 +70,8 @@ func main() {
 	// Setup routes
 	playerRouter := Routing.SetupPlayerRoutes()
 	mux.Handle("/player/", playerRouter)
+	authRouter := Routing.SetupAuthRoutes()
+	mux.Handle("/auth/", authRouter)
 
 	// Start server
 	fmt.Printf("Server starting on port %s...\n", port)
