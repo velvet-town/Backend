@@ -50,46 +50,53 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Get room manager
 	rm := GetRoomManager()
 
-	// Get player
-	rm.mainRoom.mu.RLock()
-	player, exists := rm.mainRoom.Players[playerID]
-	rm.mainRoom.mu.RUnlock()
+	// Find player in any room
+	player := rm.GetPlayer(playerID)
+	if player == nil {
+		log.Printf("Player %s not found in any room for WebSocket connection", playerID)
+		return
+	}
 
-	if !exists {
+	// Get the room containing this player
+	room := rm.GetPlayerRoom(playerID)
+	if room == nil {
+		log.Printf("Room not found for player %s", playerID)
 		return
 	}
 
 	// Update player's WebSocket connection
-	rm.mainRoom.mu.Lock()
+	room.mu.Lock()
 	player.WS = conn
 	player.IsActive = true
 	player.LastSeen = time.Now()
-	rm.mainRoom.mu.Unlock()
+	room.mu.Unlock()
+
+	log.Printf("WebSocket connected for player %s in room %s", playerID, room.ID)
 
 	// Send current room state
-	rm.mainRoom.mu.RLock()
-	players := make([]*Player, 0, len(rm.mainRoom.Players))
-	for _, p := range rm.mainRoom.Players {
+	room.mu.RLock()
+	players := make([]*Player, 0, len(room.Players))
+	for _, p := range room.Players {
 		if p.ID != playerID {
 			players = append(players, p)
 		}
 	}
-	rm.mainRoom.mu.RUnlock()
+	room.mu.RUnlock()
 
-	// Send player_joined message to other players
+	// Send player_joined message to other players in the same room
 	joinMessage := WebSocketMessage{
 		Type:     "player_joined",
 		PlayerID: playerID,
 		Position: &player.Position,
 	}
 
-	rm.mainRoom.mu.RLock()
-	for id, otherPlayer := range rm.mainRoom.Players {
+	room.mu.RLock()
+	for id, otherPlayer := range room.Players {
 		if id != playerID && otherPlayer.WS != nil {
 			otherPlayer.WS.WriteJSON(joinMessage)
 		}
 	}
-	rm.mainRoom.mu.RUnlock()
+	room.mu.RUnlock()
 
 	// Send current players to new player
 	for _, p := range players {
@@ -120,44 +127,54 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			rm.RemovePlayer(playerID)
 			return
 		case "chat_message":
+			// Get the current room for this player
+			currentRoom := rm.GetPlayerRoom(playerID)
+			if currentRoom == nil {
+				log.Printf("Player %s not found in any room for chat message", playerID)
+				continue
+			}
+
 			// Always use playerID from the connection, ignore any player_id sent by the client for security and consistency
-			log.Printf("[Chat Debug] Received chat message from %s: %s (username: %s)", playerID, message.Text, message.Username)
-			// Broadcast chat message to all players except the sender
+			log.Printf("[Chat Debug] Received chat message from %s in room %s: %s (username: %s)", playerID, currentRoom.ID, message.Text, message.Username)
+			// Broadcast chat message to all players in the same room except the sender
 			chatMessage := WebSocketMessage{
 				Type:     "chat_message",
 				PlayerID: playerID,
 				Text:     message.Text,
 				Username: message.Username,
 			}
-			log.Printf("[Chat Debug] Broadcasting chat message: %+v", chatMessage)
-			rm.mainRoom.mu.RLock()
-			for id, otherPlayer := range rm.mainRoom.Players {
+			log.Printf("[Chat Debug] Broadcasting chat message to room %s: %+v", currentRoom.ID, chatMessage)
+			currentRoom.mu.RLock()
+			for id, otherPlayer := range currentRoom.Players {
 				if id != playerID && otherPlayer.WS != nil {
 					otherPlayer.WS.WriteJSON(chatMessage)
 				}
 			}
-			rm.mainRoom.mu.RUnlock()
+			currentRoom.mu.RUnlock()
 		}
 	}
 
 	// Cleanup on disconnect
-	rm.mainRoom.mu.Lock()
-	if _, exists := rm.mainRoom.Players[playerID]; exists {
-		delete(rm.mainRoom.Players, playerID)
-		log.Printf("Removed player %s from room. Remaining players: %v", playerID, rm.mainRoom.Players)
-	}
-	rm.mainRoom.mu.Unlock()
-
-	// Notify other players
-	leaveMessage := WebSocketMessage{
-		Type:     "player_left",
-		PlayerID: playerID,
-	}
-	rm.mainRoom.mu.RLock()
-	for id, otherPlayer := range rm.mainRoom.Players {
-		if id != playerID && otherPlayer.WS != nil {
-			otherPlayer.WS.WriteJSON(leaveMessage)
+	disconnectRoom := rm.GetPlayerRoom(playerID)
+	if disconnectRoom != nil {
+		disconnectRoom.mu.Lock()
+		if _, exists := disconnectRoom.Players[playerID]; exists {
+			delete(disconnectRoom.Players, playerID)
+			log.Printf("Removed player %s from room %s. Remaining players: %d", playerID, disconnectRoom.ID, len(disconnectRoom.Players))
 		}
+		disconnectRoom.mu.Unlock()
+
+		// Notify other players in the same room
+		leaveMessage := WebSocketMessage{
+			Type:     "player_left",
+			PlayerID: playerID,
+		}
+		disconnectRoom.mu.RLock()
+		for id, otherPlayer := range disconnectRoom.Players {
+			if id != playerID && otherPlayer.WS != nil {
+				otherPlayer.WS.WriteJSON(leaveMessage)
+			}
+		}
+		disconnectRoom.mu.RUnlock()
 	}
-	rm.mainRoom.mu.RUnlock()
 }

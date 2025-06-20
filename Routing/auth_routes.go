@@ -98,18 +98,31 @@ func SetupAuthRoutes() *config.Router {
 			return
 		}
 		var username, gender, email, profilePic string
-		err := config.DB.QueryRow(`SELECT username, gender, email, profile_pic FROM "User" WHERE "userId" = $1`, body.UserId).Scan(&username, &gender, &email, &profilePic)
+		var lastRoom *string
+
+		log.Printf("🔍 Fetching user data for userId: %s", body.UserId)
+		err := config.DB.QueryRow(`SELECT username, gender, email, profile_pic, last_room FROM "User" WHERE "userId" = $1`, body.UserId).Scan(&username, &gender, &email, &profilePic, &lastRoom)
 		if err != nil {
-			log.Println("Database error:", err)
+			log.Printf("❌ Database error getting user %s: %v", body.UserId, err)
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
 		}
+
+		lastRoomStr := ""
+		if lastRoom != nil {
+			lastRoomStr = *lastRoom
+			log.Printf("✅ Found last_room for user %s: %s", body.UserId, lastRoomStr)
+		} else {
+			log.Printf("⚠️ No last_room found for user %s", body.UserId)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"username":    username,
 			"gender":      gender,
 			"email":       email,
 			"profile_pic": profilePic,
+			"last_room":   lastRoomStr,
 		})
 	})
 
