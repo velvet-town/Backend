@@ -60,10 +60,42 @@ func SetupPlayerRoutes() *config.Router {
 		json.NewEncoder(w).Encode(response)
 	})
 
+	// Database stats endpoint for monitoring
+	router.HandleFunc("/db-stats", handleDatabaseStats)
+
 	// WebSocket endpoint for real-time communication
 	router.HandleFunc("/ws", handleWebSocket)
 
 	return router
+}
+
+// handleDatabaseStats returns database connection pool statistics
+func handleDatabaseStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats := config.GetDBStats()
+
+	response := map[string]interface{}{
+		"max_open_connections": stats.MaxOpenConnections,
+		"open_connections":     stats.OpenConnections,
+		"in_use":               stats.InUse,
+		"idle":                 stats.Idle,
+		"wait_count":           stats.WaitCount,
+		"wait_duration_ms":     stats.WaitDuration.Milliseconds(),
+		"max_idle_closed":      stats.MaxIdleClosed,
+		"max_idle_time_closed": stats.MaxIdleTimeClosed,
+		"max_lifetime_closed":  stats.MaxLifetimeClosed,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding database stats response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 // handleJoinRoom handles player joining a room
@@ -91,26 +123,8 @@ func handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 💾 Update last_room in User table
-	if config.DB != nil {
-		log.Printf("💾 Updating last_room for player %s to room %s", playerID, room.ID)
-		updateQuery := `UPDATE "User" SET last_room = $1 WHERE "userId" = $2`
-
-		result, err := config.DB.Exec(updateQuery, room.ID, playerID)
-		if err != nil {
-			log.Printf("⚠️ Warning: Failed to update last_room in database: %v", err)
-			// Don't fail the request, just log the warning
-		} else {
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected > 0 {
-				log.Printf("✅ Successfully updated last_room for player %s to room %s", playerID, room.ID)
-			} else {
-				log.Printf("⚠️ Warning: No rows updated for player %s (user might not exist in database)", playerID)
-			}
-		}
-	} else {
-		log.Printf("⚠️ Warning: Database not available, skipping last_room update")
-	}
+	// 💾 Update last_room in User table (async - non-blocking)
+	config.UpdateLastRoomAsync(playerID, room.ID)
 
 	// Get all players in the room
 	players := make([]map[string]interface{}, 0)
@@ -187,26 +201,8 @@ func handleJoinSpecificRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 💾 Update last_room in User table
-	if config.DB != nil {
-		log.Printf("💾 Updating last_room for player %s to room %s", playerID, room.ID)
-		updateQuery := `UPDATE "User" SET last_room = $1 WHERE "userId" = $2`
-
-		result, err := config.DB.Exec(updateQuery, room.ID, playerID)
-		if err != nil {
-			log.Printf("⚠️ Warning: Failed to update last_room in database: %v", err)
-			// Don't fail the request, just log the warning
-		} else {
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected > 0 {
-				log.Printf("✅ Successfully updated last_room for player %s to room %s", playerID, room.ID)
-			} else {
-				log.Printf("⚠️ Warning: No rows updated for player %s (user might not exist in database)", playerID)
-			}
-		}
-	} else {
-		log.Printf("⚠️ Warning: Database not available, skipping last_room update")
-	}
+	// 💾 Update last_room in User table (async - non-blocking)
+	config.UpdateLastRoomAsync(playerID, room.ID)
 
 	// Get all players in the room
 	players := make([]map[string]interface{}, 0)

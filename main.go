@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 	"velvet/Routing"
 
 	"velvet/config"
@@ -31,6 +35,13 @@ func main() {
 	if err := config.InitDB(); err != nil {
 		log.Fatal("Error initializing database:", err)
 	}
+
+	// Set up graceful shutdown
+	defer func() {
+		if err := config.CloseDB(); err != nil {
+			log.Printf("Error closing database: %v", err)
+		}
+	}()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -64,9 +75,36 @@ func main() {
 	authRouter := Routing.SetupAuthRoutes()
 	mux.Handle("/auth/", authRouter)
 
-	// Start server
-	fmt.Printf("Server starting on port %s...\n", port)
-	if err := http.ListenAndServe(port, corsHandler); err != nil {
-		log.Fatal("Error starting server: ", err)
+	// Create HTTP server
+	server := &http.Server{
+		Addr:    port,
+		Handler: corsHandler,
 	}
+
+	// Channel to listen for interrupt signal to terminate server
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start server in a goroutine
+	go func() {
+		fmt.Printf("Server starting on port %s...\n", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("Error starting server: ", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	<-quit
+	log.Println("Shutting down server...")
+
+	// Create context with timeout for graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Gracefully shutdown the server
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server exited")
 }
