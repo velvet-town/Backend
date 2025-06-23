@@ -63,6 +63,9 @@ func SetupPlayerRoutes() *config.Router {
 	// Database stats endpoint for monitoring
 	router.HandleFunc("/db-stats", handleDatabaseStats)
 
+	// WebSocket connection stats endpoint for monitoring
+	router.HandleFunc("/ws-stats", handleWebSocketStats)
+
 	// WebSocket endpoint for real-time communication
 	router.HandleFunc("/ws", handleWebSocket)
 
@@ -93,6 +96,45 @@ func handleDatabaseStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Error encoding database stats response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// handleWebSocketStats returns WebSocket connection statistics
+func handleWebSocketStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	wsStats := Player_Logic.GetConnectionStats()
+	dbStats := config.GetDBStats()
+	roomStats := roomManager.GetRoomStats()
+	managerStats := roomManager.GetManagerStats()
+
+	response := map[string]interface{}{
+		"websocket": wsStats,
+		"database": map[string]interface{}{
+			"active_connections": dbStats.OpenConnections,
+			"max_connections":    dbStats.MaxOpenConnections,
+		},
+		"rooms":        roomStats,
+		"room_manager": managerStats,
+		"server_performance": map[string]interface{}{
+			"buffer_size_kb":          8, // 8KB buffers
+			"batching_enabled":        true,
+			"async_broadcasting":      true,
+			"connection_pooling":      true,
+			"o1_player_lookup":        true,
+			"reduced_lock_contention": true,
+			"automatic_cleanup":       true,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding WebSocket stats response: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}

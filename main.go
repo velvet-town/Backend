@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"velvet/Player_Logic"
 	"velvet/Routing"
 
 	"velvet/config"
@@ -36,11 +37,22 @@ func main() {
 		log.Fatal("Error initializing database:", err)
 	}
 
+	// Initialize room manager (starts cleanup routines)
+	roomManager := Player_Logic.GetRoomManager()
+
 	// Set up graceful shutdown
 	defer func() {
+		log.Println("Starting graceful shutdown...")
+
+		// Shutdown room manager cleanup routines
+		roomManager.Shutdown()
+
+		// Close database connections
 		if err := config.CloseDB(); err != nil {
 			log.Printf("Error closing database: %v", err)
 		}
+
+		log.Println("Graceful shutdown completed")
 	}()
 
 	port := os.Getenv("PORT")

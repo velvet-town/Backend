@@ -1,38 +1,110 @@
 package Player_Logic
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// Allow all origins for development
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-	// Enable compression
-	EnableCompression: true,
-	// Handle subprotocols if needed
-	Subprotocols: []string{"json"},
+// WebSocket performance configuration
+const (
+	// Buffer sizes optimized for multiplayer games
+	ReadBufferSize  = 8192 // 8KB for incoming messages
+	WriteBufferSize = 8192 // 8KB for outgoing messages
+
+	// Message batching configuration
+	BatchSize    = 10                    // Max messages per batch
+	BatchTimeout = 50 * time.Millisecond // Max wait time before sending batch
+
+	// Connection limits
+	MaxConcurrentConnections = 1000
+
+	// Timeouts
+	WriteTimeout = 10 * time.Second
+	ReadTimeout  = 60 * time.Second
+	PongTimeout  = 60 * time.Second
+	PingPeriod   = 54 * time.Second
+)
+
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:    ReadBufferSize,
+		WriteBufferSize:   WriteBufferSize,
+		EnableCompression: true,
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for development
+		},
+		Subprotocols: []string{"json"},
+	}
+
+	// Connection pool management
+	connectionPool = &ConnectionPool{
+		connections: make(map[string]*Connection),
+		mu:          sync.RWMutex{},
+	}
+
+	// Message batching
+	messageBatcher = &MessageBatcher{
+		batches: make(map[string]*MessageBatch),
+		mu:      sync.RWMutex{},
+	}
+)
+
+// Connection represents an optimized WebSocket connection
+type Connection struct {
+	ws       *websocket.Conn
+	playerID string
+	roomID   string
+	send     chan []byte
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.RWMutex
+}
+
+// ConnectionPool manages all WebSocket connections
+type ConnectionPool struct {
+	connections map[string]*Connection
+	mu          sync.RWMutex
+	count       int
+}
+
+// MessageBatch holds batched messages for efficient sending
+type MessageBatch struct {
+	messages []WebSocketMessage
+	timer    *time.Timer
+	mu       sync.Mutex
+}
+
+// MessageBatcher manages message batching per room
+type MessageBatcher struct {
+	batches map[string]*MessageBatch
+	mu      sync.RWMutex
 }
 
 // WebSocketMessage represents a message sent over WebSocket
 type WebSocketMessage struct {
-	Type     string          `json:"type"`
-	PlayerID string          `json:"player_id"`
-	Position *Position       `json:"position,omitempty"`
-	Data     json.RawMessage `json:"data,omitempty"`
-	Text     string          `json:"text,omitempty"`
-	Username string          `json:"username,omitempty"`
+	Type      string          `json:"type"`
+	PlayerID  string          `json:"player_id"`
+	Position  *Position       `json:"position,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	Text      string          `json:"text,omitempty"`
+	Username  string          `json:"username,omitempty"`
+	Timestamp int64           `json:"timestamp,omitempty"`
 }
 
-// HandleWebSocket handles WebSocket connections
+// BatchedMessage contains multiple messages for efficient transmission
+type BatchedMessage struct {
+	Type     string             `json:"type"`
+	Messages []WebSocketMessage `json:"messages"`
+	Count    int                `json:"count"`
+}
+
+// HandleWebSocket handles WebSocket connections with optimizations
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	playerID := r.URL.Query().Get("token")
 	if playerID == "" {
@@ -40,12 +112,19 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check connection limit
+	if !connectionPool.canAcceptConnection() {
+		http.Error(w, "Server at capacity", http.StatusServiceUnavailable)
+		log.Printf("Connection rejected for player %s: server at capacity", playerID)
+		return
+	}
+
 	// Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("WebSocket upgrade failed for player %s: %v", playerID, err)
 		return
 	}
-	defer conn.Close()
 
 	// Get room manager
 	rm := GetRoomManager()
@@ -54,6 +133,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	player := rm.GetPlayer(playerID)
 	if player == nil {
 		log.Printf("Player %s not found in any room for WebSocket connection", playerID)
+		conn.Close()
 		return
 	}
 
@@ -61,8 +141,24 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	room := rm.GetPlayerRoom(playerID)
 	if room == nil {
 		log.Printf("Room not found for player %s", playerID)
+		conn.Close()
 		return
 	}
+
+	// Create optimized connection
+	ctx, cancel := context.WithCancel(context.Background())
+	connection := &Connection{
+		ws:       conn,
+		playerID: playerID,
+		roomID:   room.ID,
+		send:     make(chan []byte, 256), // Buffered channel for async sending
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+
+	// Register connection
+	connectionPool.addConnection(playerID, connection)
+	defer connectionPool.removeConnection(playerID)
 
 	// Update player's WebSocket connection
 	room.mu.Lock()
@@ -73,110 +169,287 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("WebSocket connected for player %s in room %s", playerID, room.ID)
 
-	// Send current room state
+	// Send initial room state
+	connection.sendInitialRoomState(room, playerID)
+
+	// Start connection handlers
+	go connection.writePump()
+	go connection.readPump(rm)
+
+	// Wait for connection to close
+	<-ctx.Done()
+	conn.Close()
+}
+
+// canAcceptConnection checks if server can accept more connections
+func (cp *ConnectionPool) canAcceptConnection() bool {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return cp.count < MaxConcurrentConnections
+}
+
+// addConnection adds a connection to the pool
+func (cp *ConnectionPool) addConnection(playerID string, conn *Connection) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	// Remove existing connection if any
+	if existingConn, exists := cp.connections[playerID]; exists {
+		existingConn.cancel()
+		delete(cp.connections, playerID)
+		cp.count--
+	}
+
+	cp.connections[playerID] = conn
+	cp.count++
+	log.Printf("Connection pool: %d/%d connections", cp.count, MaxConcurrentConnections)
+}
+
+// removeConnection removes a connection from the pool
+func (cp *ConnectionPool) removeConnection(playerID string) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if conn, exists := cp.connections[playerID]; exists {
+		conn.cancel()
+		delete(cp.connections, playerID)
+		cp.count--
+		log.Printf("Connection pool: %d/%d connections", cp.count, MaxConcurrentConnections)
+	}
+}
+
+// getConnection retrieves a connection from the pool
+func (cp *ConnectionPool) getConnection(playerID string) (*Connection, bool) {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	conn, exists := cp.connections[playerID]
+	return conn, exists
+}
+
+// sendInitialRoomState sends current players to newly connected player
+func (c *Connection) sendInitialRoomState(room *Room, playerID string) {
 	room.mu.RLock()
-	players := make([]*Player, 0, len(room.Players))
-	for _, p := range room.Players {
-		if p.ID != playerID {
-			players = append(players, p)
+	defer room.mu.RUnlock()
+
+	var messages []WebSocketMessage
+	for id, p := range room.Players {
+		if id != playerID {
+			messages = append(messages, WebSocketMessage{
+				Type:      "player_joined",
+				PlayerID:  p.ID,
+				Position:  &p.Position,
+				Username:  p.Username,
+				Timestamp: time.Now().UnixMilli(),
+			})
 		}
 	}
-	room.mu.RUnlock()
 
-	// Send player_joined message to other players in the same room
+	if len(messages) > 0 {
+		c.sendBatchedMessages(messages)
+	}
+
+	// Notify other players about new player
 	joinMessage := WebSocketMessage{
-		Type:     "player_joined",
-		PlayerID: playerID,
-		Position: &player.Position,
-		Username: player.Username,
+		Type:      "player_joined",
+		PlayerID:  playerID,
+		Position:  &room.Players[playerID].Position,
+		Username:  room.Players[playerID].Username,
+		Timestamp: time.Now().UnixMilli(),
 	}
 
-	room.mu.RLock()
-	for id, otherPlayer := range room.Players {
-		if id != playerID && otherPlayer.WS != nil {
-			otherPlayer.WS.WriteJSON(joinMessage)
-		}
-	}
-	room.mu.RUnlock()
+	// Broadcast to other players asynchronously
+	go broadcastToRoomAsync(room, playerID, joinMessage)
+}
 
-	// Send current players to new player
-	for _, p := range players {
-		message := WebSocketMessage{
-			Type:     "player_joined",
-			PlayerID: p.ID,
-			Position: &p.Position,
-			Username: p.Username,
-		}
-		if err := conn.WriteJSON(message); err != nil {
+// writePump handles outgoing messages with batching
+func (c *Connection) writePump() {
+	ticker := time.NewTicker(PingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.ws.Close()
+		c.cancel()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.ws.SetWriteDeadline(time.Now().Add(WriteTimeout))
+			if !ok {
+				c.ws.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			if err := c.ws.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Printf("Write error for player %s: %v", c.playerID, err)
+				return
+			}
+
+		case <-ticker.C:
+			c.ws.SetWriteDeadline(time.Now().Add(WriteTimeout))
+			if err := c.ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+
+		case <-c.ctx.Done():
 			return
 		}
 	}
+}
 
-	// Handle WebSocket messages
+// readPump handles incoming messages
+func (c *Connection) readPump(rm *RoomManager) {
+	defer c.cancel()
+
+	c.ws.SetReadDeadline(time.Now().Add(ReadTimeout))
+	c.ws.SetPongHandler(func(string) error {
+		c.ws.SetReadDeadline(time.Now().Add(PongTimeout))
+		return nil
+	})
+
 	for {
 		var message WebSocketMessage
-		err := conn.ReadJSON(&message)
+		err := c.ws.ReadJSON(&message)
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error for player %s: %v", c.playerID, err)
+			}
 			break
 		}
 
-		switch message.Type {
-		case "position_update":
-			if message.Position != nil {
-				rm.handlePositionUpdate(playerID, *message.Position, message.Username)
-			}
-		case "leave_room":
-			rm.RemovePlayer(playerID)
-			return
-		case "chat_message":
-			// Get the current room for this player
-			currentRoom := rm.GetPlayerRoom(playerID)
-			if currentRoom == nil {
-				log.Printf("Player %s not found in any room for chat message", playerID)
-				continue
-			}
-
-			// Always use playerID from the connection, ignore any player_id sent by the client for security and consistency
-			log.Printf("[Chat Debug] Received chat message from %s in room %s: %s (username: %s)", playerID, currentRoom.ID, message.Text, message.Username)
-			// Broadcast chat message to all players in the same room except the sender
-			chatMessage := WebSocketMessage{
-				Type:     "chat_message",
-				PlayerID: playerID,
-				Text:     message.Text,
-				Username: message.Username,
-			}
-			log.Printf("[Chat Debug] Broadcasting chat message to room %s: %+v", currentRoom.ID, chatMessage)
-			currentRoom.mu.RLock()
-			for id, otherPlayer := range currentRoom.Players {
-				if id != playerID && otherPlayer.WS != nil {
-					otherPlayer.WS.WriteJSON(chatMessage)
-				}
-			}
-			currentRoom.mu.RUnlock()
-		}
+		c.ws.SetReadDeadline(time.Now().Add(ReadTimeout))
+		c.handleMessage(rm, message)
 	}
 
 	// Cleanup on disconnect
-	disconnectRoom := rm.GetPlayerRoom(playerID)
-	if disconnectRoom != nil {
-		disconnectRoom.mu.Lock()
-		if _, exists := disconnectRoom.Players[playerID]; exists {
-			delete(disconnectRoom.Players, playerID)
-			log.Printf("Removed player %s from room %s. Remaining players: %d", playerID, disconnectRoom.ID, len(disconnectRoom.Players))
-		}
-		disconnectRoom.mu.Unlock()
+	c.handleDisconnect(rm)
+}
 
-		// Notify other players in the same room
-		leaveMessage := WebSocketMessage{
-			Type:     "player_left",
-			PlayerID: playerID,
+// handleMessage processes incoming WebSocket messages
+func (c *Connection) handleMessage(rm *RoomManager, message WebSocketMessage) {
+	switch message.Type {
+	case "position_update":
+		if message.Position != nil {
+			rm.handlePositionUpdateOptimized(c.playerID, *message.Position, message.Username)
 		}
-		disconnectRoom.mu.RLock()
-		for id, otherPlayer := range disconnectRoom.Players {
-			if id != playerID && otherPlayer.WS != nil {
-				otherPlayer.WS.WriteJSON(leaveMessage)
+	case "leave_room":
+		rm.RemovePlayer(c.playerID)
+		c.cancel()
+	case "chat_message":
+		c.handleChatMessage(rm, message)
+	}
+}
+
+// handleChatMessage processes chat messages
+func (c *Connection) handleChatMessage(rm *RoomManager, message WebSocketMessage) {
+	room := rm.GetPlayerRoom(c.playerID)
+	if room == nil {
+		log.Printf("Player %s not found in any room for chat message", c.playerID)
+		return
+	}
+
+	chatMessage := WebSocketMessage{
+		Type:      "chat_message",
+		PlayerID:  c.playerID,
+		Text:      message.Text,
+		Username:  message.Username,
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	// Broadcast chat message asynchronously
+	go broadcastToRoomAsync(room, c.playerID, chatMessage)
+}
+
+// handleDisconnect cleans up when player disconnects
+func (c *Connection) handleDisconnect(rm *RoomManager) {
+	room := rm.GetPlayerRoom(c.playerID)
+	if room != nil {
+		room.mu.Lock()
+		if _, exists := room.Players[c.playerID]; exists {
+			delete(room.Players, c.playerID)
+			log.Printf("Removed player %s from room %s. Remaining players: %d",
+				c.playerID, room.ID, len(room.Players))
+		}
+		room.mu.Unlock()
+
+		// Notify other players asynchronously
+		leaveMessage := WebSocketMessage{
+			Type:      "player_left",
+			PlayerID:  c.playerID,
+			Timestamp: time.Now().UnixMilli(),
+		}
+		go broadcastToRoomAsync(room, c.playerID, leaveMessage)
+	}
+}
+
+// sendBatchedMessages sends multiple messages efficiently
+func (c *Connection) sendBatchedMessages(messages []WebSocketMessage) {
+	if len(messages) == 0 {
+		return
+	}
+
+	batchedMessage := BatchedMessage{
+		Type:     "batch",
+		Messages: messages,
+		Count:    len(messages),
+	}
+
+	data, err := json.Marshal(batchedMessage)
+	if err != nil {
+		log.Printf("Error marshaling batch for player %s: %v", c.playerID, err)
+		return
+	}
+
+	select {
+	case c.send <- data:
+	default:
+		log.Printf("Send channel full for player %s, dropping batch", c.playerID)
+	}
+}
+
+// broadcastToRoomAsync broadcasts message to all players in room asynchronously
+func broadcastToRoomAsync(room *Room, excludePlayerID string, message WebSocketMessage) {
+	room.mu.RLock()
+	var targets []*Connection
+
+	for playerID := range room.Players {
+		if playerID != excludePlayerID {
+			if conn, exists := connectionPool.getConnection(playerID); exists {
+				targets = append(targets, conn)
 			}
 		}
-		disconnectRoom.mu.RUnlock()
+	}
+	room.mu.RUnlock()
+
+	// Send to all targets concurrently
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Error marshaling message: %v", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, conn := range targets {
+		wg.Add(1)
+		go func(c *Connection) {
+			defer wg.Done()
+			select {
+			case c.send <- data:
+			default:
+				log.Printf("Send channel full for player %s, dropping message", c.playerID)
+			}
+		}(conn)
+	}
+	wg.Wait()
+}
+
+// GetConnectionStats returns WebSocket connection statistics
+func GetConnectionStats() map[string]interface{} {
+	connectionPool.mu.RLock()
+	defer connectionPool.mu.RUnlock()
+
+	return map[string]interface{}{
+		"active_connections":  connectionPool.count,
+		"max_connections":     MaxConcurrentConnections,
+		"utilization_percent": float64(connectionPool.count) / float64(MaxConcurrentConnections) * 100,
 	}
 }
