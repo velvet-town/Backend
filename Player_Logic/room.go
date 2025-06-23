@@ -88,6 +88,7 @@ func (rm *RoomManager) AddPlayer(playerID string) (*Room, error) {
 	// Create and add player
 	player := &Player{
 		ID:       playerID,
+		Username: "", // Will be set when first position update is received
 		Position: Position{X: 0, Y: 0},
 		IsActive: true,
 		LastSeen: time.Now(),
@@ -142,6 +143,7 @@ func (rm *RoomManager) AddPlayerToSpecificRoom(playerID, roomID string) (*Room, 
 	// Create and add player
 	player := &Player{
 		ID:       playerID,
+		Username: "", // Will be set when first position update is received
 		Position: Position{X: 0, Y: 0},
 		IsActive: true,
 		LastSeen: time.Now(),
@@ -236,7 +238,7 @@ func (rm *RoomManager) GetRoomPlayers() []*Player {
 }
 
 // handlePositionUpdate updates a player's position and broadcasts it to players in the same room
-func (rm *RoomManager) handlePositionUpdate(playerID string, position Position) {
+func (rm *RoomManager) handlePositionUpdate(playerID string, position Position, username string) {
 	// Find the room containing the player
 	room := rm.GetPlayerRoom(playerID)
 	if room == nil {
@@ -250,12 +252,16 @@ func (rm *RoomManager) handlePositionUpdate(playerID string, position Position) 
 	if player, exists := room.Players[playerID]; exists {
 		player.Position = position
 		player.LastSeen = time.Now()
+		if username != "" {
+			player.Username = username
+		}
 
 		// Broadcast position to other players in the same room
 		message := WebSocketMessage{
 			Type:     "position_update",
 			PlayerID: playerID,
 			Position: &position,
+			Username: player.Username,
 		}
 
 		for id, otherPlayer := range room.Players {

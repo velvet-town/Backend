@@ -9,6 +9,7 @@ import (
 
 type Player struct {
 	ID       string          `json:"id"`
+	Username string          `json:"username"`
 	RoomID   string          `json:"room_id"`
 	Position Position        `json:"position"`
 	IsActive bool            `json:"is_active"`

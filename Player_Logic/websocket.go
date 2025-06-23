@@ -88,6 +88,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Type:     "player_joined",
 		PlayerID: playerID,
 		Position: &player.Position,
+		Username: player.Username,
 	}
 
 	room.mu.RLock()
@@ -104,6 +105,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Type:     "player_joined",
 			PlayerID: p.ID,
 			Position: &p.Position,
+			Username: p.Username,
 		}
 		if err := conn.WriteJSON(message); err != nil {
 			return
@@ -121,7 +123,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		switch message.Type {
 		case "position_update":
 			if message.Position != nil {
-				rm.handlePositionUpdate(playerID, *message.Position)
+				rm.handlePositionUpdate(playerID, *message.Position, message.Username)
 			}
 		case "leave_room":
 			rm.RemovePlayer(playerID)
