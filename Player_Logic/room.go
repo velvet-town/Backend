@@ -431,8 +431,8 @@ func (rm *RoomManager) GetRoomPlayers() []*Player {
 	return players
 }
 
-// handlePositionUpdateOptimized updates a player's position with O(1) lookup
-func (rm *RoomManager) handlePositionUpdateOptimized(playerID string, position Position, username string) {
+// handlePositionUpdate updates a player's position with O(1) lookup
+func (rm *RoomManager) handlePositionUpdate(playerID string, position Position, username string) {
 	// O(1) room lookup instead of linear search
 	room := rm.GetPlayerRoom(playerID)
 	if room == nil {
@@ -465,11 +465,6 @@ func (rm *RoomManager) handlePositionUpdateOptimized(playerID string, position P
 	}
 
 	go broadcastToRoomAsync(room, playerID, message)
-}
-
-// handlePositionUpdate legacy function for compatibility
-func (rm *RoomManager) handlePositionUpdate(playerID string, position Position, username string) {
-	rm.handlePositionUpdateOptimized(playerID, position, username)
 }
 
 // GetManagerStats returns comprehensive room manager statistics

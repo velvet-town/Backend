@@ -67,7 +67,7 @@ func SetupPlayerRoutes() *config.Router {
 	router.HandleFunc("/ws-stats", handleWebSocketStats)
 
 	// WebSocket endpoint for real-time communication
-	router.HandleFunc("/ws", handleWebSocket)
+	router.HandleFunc("/ws", Player_Logic.HandleWebSocket)
 
 	return router
 }
@@ -272,9 +272,4 @@ func handleJoinSpecificRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Join specific room request completed successfully - Player: %s, Room: %s", playerID, body.RoomID)
-}
-
-// handleWebSocket handles WebSocket connections
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	Player_Logic.HandleWebSocket(w, r)
 }

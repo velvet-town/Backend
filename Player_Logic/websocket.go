@@ -88,13 +88,14 @@ type MessageBatcher struct {
 
 // WebSocketMessage represents a message sent over WebSocket
 type WebSocketMessage struct {
-	Type      string          `json:"type"`
-	PlayerID  string          `json:"player_id"`
-	Position  *Position       `json:"position,omitempty"`
-	Data      json.RawMessage `json:"data,omitempty"`
-	Text      string          `json:"text,omitempty"`
-	Username  string          `json:"username,omitempty"`
-	Timestamp int64           `json:"timestamp,omitempty"`
+	Type           string          `json:"type"`
+	PlayerID       string          `json:"player_id"`
+	TargetPlayerID string          `json:"target_player_id,omitempty"`
+	Position       *Position       `json:"position,omitempty"`
+	Data           json.RawMessage `json:"data,omitempty"`
+	Text           string          `json:"text,omitempty"`
+	Username       string          `json:"username,omitempty"`
+	Timestamp      int64           `json:"timestamp,omitempty"`
 }
 
 // BatchedMessage contains multiple messages for efficient transmission
@@ -317,25 +318,27 @@ func (c *Connection) readPump(rm *RoomManager) {
 		}
 
 		c.ws.SetReadDeadline(time.Now().Add(ReadTimeout))
-		c.handleMessage(rm, message)
+		c.handlePlayerAction(rm, message)
 	}
 
 	// Cleanup on disconnect
 	c.handleDisconnect(rm)
 }
 
-// handleMessage processes incoming WebSocket messages
-func (c *Connection) handleMessage(rm *RoomManager, message WebSocketMessage) {
+// handlePlayerAction processes incoming WebSocket messages
+func (c *Connection) handlePlayerAction(rm *RoomManager, message WebSocketMessage) {
 	switch message.Type {
 	case "position_update":
 		if message.Position != nil {
-			rm.handlePositionUpdateOptimized(c.playerID, *message.Position, message.Username)
+			rm.handlePositionUpdate(c.playerID, *message.Position, message.Username)
 		}
 	case "leave_room":
 		rm.RemovePlayer(c.playerID)
 		c.cancel()
 	case "chat_message":
 		c.handleChatMessage(rm, message)
+	case "private_message":
+		c.handlePrivateMessage(rm, message)
 	}
 }
 
@@ -357,6 +360,84 @@ func (c *Connection) handleChatMessage(rm *RoomManager, message WebSocketMessage
 
 	// Broadcast chat message asynchronously
 	go broadcastToRoomAsync(room, c.playerID, chatMessage)
+}
+
+// handlePrivateMessage processes private messages between players
+func (c *Connection) handlePrivateMessage(rm *RoomManager, message WebSocketMessage) {
+	if message.TargetPlayerID == "" {
+		log.Printf("Private message from %s missing target player ID", c.playerID)
+		return
+	}
+
+	if message.TargetPlayerID == c.playerID {
+		log.Printf("Player %s tried to send private message to themselves", c.playerID)
+		return
+	}
+
+	// Check if target player exists and is online
+	targetPlayer := rm.GetPlayer(message.TargetPlayerID)
+	if targetPlayer == nil {
+		log.Printf("Target player %s not found for private message from %s", message.TargetPlayerID, c.playerID)
+		// Send error message back to sender
+		errorMessage := WebSocketMessage{
+			Type:      "private_message_error",
+			PlayerID:  "system",
+			Text:      "Player not found or offline",
+			Timestamp: time.Now().UnixMilli(),
+		}
+		data, err := json.Marshal(errorMessage)
+		if err == nil {
+			select {
+			case c.send <- data:
+			default:
+				log.Printf("Send channel full for player %s, dropping message", c.playerID)
+			}
+		}
+		return
+	}
+
+	// Create private message for target player
+	privateMessage := WebSocketMessage{
+		Type:           "private_message",
+		PlayerID:       c.playerID,
+		TargetPlayerID: message.TargetPlayerID,
+		Text:           message.Text,
+		Username:       message.Username,
+		Timestamp:      time.Now().UnixMilli(),
+	}
+
+	// Send to target player directly
+	if conn, exists := connectionPool.getConnection(message.TargetPlayerID); exists {
+		data, err := json.Marshal(privateMessage)
+		if err == nil {
+			select {
+			case conn.send <- data:
+			default:
+				log.Printf("Send channel full for player %s, dropping private message", message.TargetPlayerID)
+			}
+		}
+	} else {
+		log.Printf("Player %s not connected, cannot send private message", message.TargetPlayerID)
+	}
+
+	// Send confirmation to sender directly
+	confirmationMessage := WebSocketMessage{
+		Type:           "private_message_sent",
+		PlayerID:       "system",
+		TargetPlayerID: message.TargetPlayerID,
+		Text:           "Message sent successfully",
+		Timestamp:      time.Now().UnixMilli(),
+	}
+	data, err := json.Marshal(confirmationMessage)
+	if err == nil {
+		select {
+		case c.send <- data:
+		default:
+			log.Printf("Send channel full for player %s, dropping confirmation message", c.playerID)
+		}
+	}
+
+	log.Printf("Private message sent from %s to %s", c.playerID, message.TargetPlayerID)
 }
 
 // handleDisconnect cleans up when player disconnects
