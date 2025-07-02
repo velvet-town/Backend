@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +65,9 @@ type Connection struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	mu       sync.RWMutex
+	// Rate limiting
+	lastMessageTime time.Time
+	messageCount    int
 }
 
 // ConnectionPool manages all WebSocket connections
@@ -364,6 +368,31 @@ func (c *Connection) handleChatMessage(rm *RoomManager, message WebSocketMessage
 
 // handlePrivateMessage processes private messages between players
 func (c *Connection) handlePrivateMessage(rm *RoomManager, message WebSocketMessage) {
+	// Rate limiting: max 20 messages per minute
+	now := time.Now()
+	if now.Sub(c.lastMessageTime) < time.Minute {
+		c.messageCount++
+		if c.messageCount > 20 {
+			log.Printf("Rate limit exceeded for player %s", c.playerID)
+			return
+		}
+	} else {
+		c.messageCount = 1
+		c.lastMessageTime = now
+	}
+
+	// Validate message length (max 500 characters)
+	if len(message.Text) > 500 {
+		log.Printf("Private message from %s too long (%d characters)", c.playerID, len(message.Text))
+		return
+	}
+
+	// Validate message content
+	if strings.TrimSpace(message.Text) == "" {
+		log.Printf("Private message from %s is empty or whitespace only", c.playerID)
+		return
+	}
+
 	if message.TargetPlayerID == "" {
 		log.Printf("Private message from %s missing target player ID", c.playerID)
 		return
