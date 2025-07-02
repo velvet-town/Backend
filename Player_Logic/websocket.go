@@ -111,16 +111,22 @@ type BatchedMessage struct {
 
 // HandleWebSocket handles WebSocket connections with optimizations
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	log.Printf("WebSocket connection attempt from %s", r.RemoteAddr)
+	log.Printf("Request headers: %v", r.Header)
+
 	playerID := r.URL.Query().Get("token")
 	if playerID == "" {
+		log.Printf("WebSocket connection rejected: no token provided")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
+	log.Printf("WebSocket connection attempt for player: %s", playerID)
+
 	// Check connection limit
 	if !connectionPool.canAcceptConnection() {
-		http.Error(w, "Server at capacity", http.StatusServiceUnavailable)
 		log.Printf("Connection rejected for player %s: server at capacity", playerID)
+		http.Error(w, "Server at capacity", http.StatusServiceUnavailable)
 		return
 	}
 
