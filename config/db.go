@@ -83,7 +83,19 @@ func initPreparedStatements() error {
 	preparedStatements.mu.Lock()
 	defer preparedStatements.mu.Unlock()
 
+	// Close existing statements if they exist
+	if preparedStatements.updateLastRoom != nil {
+		preparedStatements.updateLastRoom.Close()
+		preparedStatements.updateLastRoom = nil
+	}
+
 	var err error
+
+	// Try to deallocate any existing prepared statements to avoid conflicts
+	_, deallocErr := DB.Exec("DEALLOCATE ALL")
+	if deallocErr != nil {
+		log.Printf("Warning: Failed to deallocate existing prepared statements: %v", deallocErr)
+	}
 
 	// Prepare statement for updating user's last room
 	preparedStatements.updateLastRoom, err = DB.Prepare(`UPDATE "User" SET last_room = $1 WHERE "userId" = $2`)
@@ -174,6 +186,28 @@ func GetDBStats() sql.DBStats {
 		return sql.DBStats{}
 	}
 	return DB.Stats()
+}
+
+// GetUserLastRoom retrieves the last room for a user (call this during sign-in)
+func GetUserLastRoom(userID string) (string, error) {
+	if DB == nil {
+		return "", fmt.Errorf("database not initialized")
+	}
+
+	var lastRoom *string
+	err := DB.QueryRow(`SELECT last_room FROM "User" WHERE "userId" = $1`, userID).Scan(&lastRoom)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil // User doesn't exist, return empty string
+		}
+		return "", fmt.Errorf("failed to get last room for user %s: %w", userID, err)
+	}
+
+	if lastRoom == nil {
+		return "", nil // No last room set
+	}
+
+	return *lastRoom, nil
 }
 
 // CloseDB gracefully closes the database connection and prepared statements
